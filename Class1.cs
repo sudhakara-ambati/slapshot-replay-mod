@@ -7,14 +7,18 @@ using System.IO;
 using System.Runtime.Serialization;
 using System.Runtime.Serialization.Formatters.Binary;
 using Il2Cpp;
-using Harmony;
-using System.Linq;
-
+using System.Threading.Tasks;
 namespace SlapshotReplayMod
 {
     public class ReplayMod : MelonMod
     {
+        private GameObject gamePuck;
+        private GameObject[] playbackPlayers;
+        private bool fetchedPlayers = false;
+
         private bool _isGuiVisible;
+        private bool _isPopupVisible;
+        private bool _isPopupActive;
         private Rect _guiWindowRect = new Rect(20, 20, 300, 400);
         private List<string> _replayFiles = new List<string>();
         private Vector2 _scrollPosition;
@@ -27,11 +31,15 @@ namespace SlapshotReplayMod
         private List<FrameData> recordedFrames = new List<FrameData>();
         private List<FrameData> circularBuffer = new List<FrameData>();
         private int currentFrameIndex = 0;
-        private float recordingInterval = 1.0f / 140.0f;
-        private float playbackInterval = 1.0f / 140.0f;
+        private float recordingInterval = 1.0f / 120.0f;
+        private float playbackInterval = 1.0f / 120.0f;
         private float lastRecordedTime = 0.0f;
         private float lastPlaybackTime = 0.0f;
         private float bufferDuration = 15.0f;
+
+        private string popupMessage = "";
+        private float popupDuration = 3.0f;
+        private float popupStartTime;
         private int maxBufferFrames => Mathf.CeilToInt(bufferDuration / recordingInterval);
 
         private string replayDirectory = Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData), "SlapshotReboundReplays");
@@ -50,14 +58,23 @@ namespace SlapshotReplayMod
         {
             if (Input.GetKeyDown(KeyCode.F1))
             {
+                _isPopupVisible = true;
+                popupMessage = "Started Recording";
+                popupStartTime = Time.time;
                 StartRecording();
             }
             if (Input.GetKeyDown(KeyCode.F2))
             {
+                _isPopupVisible = true;
+                popupMessage = "Saved Recording";
+                popupStartTime = Time.time;
                 StopRecording();
             }
             if (Input.GetKeyDown(KeyCode.F4))
             {
+                _isPopupVisible = true;
+                popupMessage = "Clip Saved";
+                popupStartTime = Time.time;
                 SaveCircularBuffer();
             }
             if (Input.GetKeyDown(KeyCode.F5))
@@ -79,6 +96,10 @@ namespace SlapshotReplayMod
             if (Input.GetKeyDown(KeyCode.LeftArrow))
             {
                 SeekPlayback(-5);
+            }
+            if (Input.GetKeyDown(KeyCode.UpArrow))
+            {
+                StopPlaybackAndReset();
             }
 
             float currentTime = Time.time;
@@ -118,6 +139,16 @@ namespace SlapshotReplayMod
             {
                 _guiWindowRect = GUI.Window(0, _guiWindowRect, (GUI.WindowFunction)GuiWindowFunction, "Replay Mod");
             }
+
+            if (_isPopupVisible)
+            {
+                DisplayPopup(popupMessage);
+
+                if (Time.time - popupStartTime >= popupDuration)
+                {
+                    _isPopupVisible = false;
+                }
+            }
         }
 
         private void GuiWindowFunction(int windowId)
@@ -136,6 +167,8 @@ namespace SlapshotReplayMod
                 {
                     if (GUILayout.Button(Path.GetFileNameWithoutExtension(replayFile)))
                     {
+                        MelonLogger.Msg(Path.GetFileNameWithoutExtension(replayFile));
+                        gamePuck = GameObject.Find("puck(Clone)");
                         _selectedReplay = replayFile;
                         LoadSpecificReplay(_selectedReplay);
                         _isGuiVisible = false;
@@ -344,11 +377,19 @@ namespace SlapshotReplayMod
 
         private void PlaybackFrame(FrameData frameData)
         {
-            GameObject[] players = GameObject.FindGameObjectsWithTag("Player");
-
-            for (int i = 0; i < players.Length && i < frameData.PlayersData.Count; i++)
+            if (fetchedPlayers == false)
             {
-                GameObject playerObject = players[i];
+                playbackPlayers = GameObject.FindGameObjectsWithTag("Player");
+            }
+
+            if (playbackPlayers.Length == frameData.PlayersData.Count)
+            {
+                fetchedPlayers = true;
+            }
+
+            for (int i = 0; i < playbackPlayers.Length && i < frameData.PlayersData.Count; i++)
+            {
+                GameObject playerObject = playbackPlayers[i];
                 PlayerData playerData = frameData.PlayersData[i];
 
                 playerObject.transform.position = playerData.Position.ToVector3();
@@ -365,11 +406,10 @@ namespace SlapshotReplayMod
                 }
             }
 
-            GameObject puck = GameObject.Find("puck(Clone)");
-            if (puck != null)
+            if (gamePuck != null)
             {
-                puck.transform.position = frameData.PuckPosition.ToVector3();
-                puck.transform.rotation = frameData.PuckRotation.ToQuaternion();
+                gamePuck.transform.position = frameData.PuckPosition.ToVector3();
+                gamePuck.transform.rotation = frameData.PuckRotation.ToQuaternion();
             }
         }
 
@@ -385,54 +425,89 @@ namespace SlapshotReplayMod
                 {
                     GameObject playerObject = players[i];
                     PlayerData playerData = initialFrame.PlayersData[i];
-
-                    var customization = playerObject.GetComponent<PlayerCustomization>();
-                    if (customization != null)
+                    if (playerObject.name == "player(Clone)")
                     {
-                        List<string> cosmeticTypes = new List<string>() { "hat", "gloves", "pants", "stick", "jersey", "back", "hairstyle", "mouth_decal", "face_decal", "eyes_decal" };
-                        foreach (string type in cosmeticTypes)
+                        // Check for PlayerCustomization component
+                        var customization = playerObject.GetComponent<PlayerCustomization>();
+                        if (customization != null)
                         {
-                            customization.DestroyCosmeticsOfType(type);
+                            List<string> cosmeticTypes = new List<string>() { "hat", "gloves", "pants", "stick", "jersey", "back", "hairstyle", "mouth_decal", "face_decal", "eyes_decal" };
+                            foreach (string type in cosmeticTypes)
+                            {
+                                customization.DestroyCosmeticsOfType(type);
+                            }
+
+                            customization.currentCosmeticFullKey.Clear();
+
+                            foreach (var cosmetic in playerData.CosmeticsData)
+                            {
+                                customization.LoadCosmetic(cosmetic.Type, cosmetic.Item, cosmetic.Variant);
+                            }
+                        }
+                        else
+                        {
+                            MelonLogger.Error("PlayerCustomization component not found on player object.");
                         }
 
-                        customization.currentCosmeticFullKey.Clear();
-
-                        foreach (var cosmetic in playerData.CosmeticsData)
+                        // Check for Player component
+                        var teamComponent = playerObject.GetComponent<Player>();
+                        if (teamComponent != null)
                         {
-                            customization.LoadCosmetic(cosmetic.Type, cosmetic.Item, cosmetic.Variant);
+                            if (playerData.Teams.Count > 0)
+                            {
+                                teamComponent.Team = playerData.Teams[0];
+                            }
+
+                            if (playerData.Usernames.Count > 0)
+                            {
+                                teamComponent.Username = playerData.Usernames[0];
+                            }
+
+                            if (playerData.IsRightHanded.Count > 0)
+                            {
+                                teamComponent.SetRightHandedness(playerData.IsRightHanded[0]);
+                            }
                         }
-                    }
-
-                    var teamComponent = playerObject.GetComponent<Player>();
-                    if (teamComponent != null)
-                    {
-                        if (playerData.Teams.Count > 0)
+                        else
                         {
-                            teamComponent.Team = playerData.Teams[0];
+                            MelonLogger.Error("Player component not found on player object.");
                         }
 
-                        if (playerData.Usernames.Count > 0)
+                        // Handle missing child objects
+                        foreach (var childData in playerData.ChildObjectsData)
                         {
-                            teamComponent.Username = playerData.Usernames[0];
-                        }
-
-                        if (playerData.IsRightHanded.Count > 0)
-                        {
-                            teamComponent.SetRightHandedness(playerData.IsRightHanded[0]);
-                        }
-                    }
-
-                    foreach (var childData in playerData.ChildObjectsData)
-                    {
-                        Transform childTransform = playerObject.transform.Find(childData.Name);
-                        if (childTransform != null)
-                        {
-                            childTransform.position = childData.Position.ToVector3();
-                            childTransform.rotation = childData.Rotation.ToQuaternion();
+                            Transform childTransform = playerObject.transform.Find(childData.Name);
+                            if (childTransform != null)
+                            {
+                                childTransform.position = childData.Position.ToVector3();
+                                childTransform.rotation = childData.Rotation.ToQuaternion();
+                            }
+                            else
+                            {
+                                MelonLogger.Error($"Child object '{childData.Name}' not found on player object.");
+                            }
                         }
                     }
                 }
             }
+        }
+
+
+        private void StopPlaybackAndReset()
+        {
+            isPlaying = false;
+            isPaused = false;
+            hasFinishedPlaying = false;
+            currentFrameIndex = 0;
+            lastPlaybackTime = 0.0f;
+            MelonLogger.Msg("Playback stopped and reset.");
+        }
+
+        private void DisplayPopup(string message)
+        {
+            GUILayout.BeginArea(new Rect(Screen.width / 2 - 100, Screen.height - 100, 200, 50), GUI.skin.box);
+            GUILayout.Label(message);
+            GUILayout.EndArea();
         }
 
         private IEnumerator TogglePlayersCoroutine()
@@ -511,18 +586,21 @@ namespace SlapshotReplayMod
             }
         }
 
-        private void SaveRecording()
+        private async Task SaveRecording()
         {
             try
             {
                 string timestamp = DateTime.Now.ToString("yyyyMMdd_HHmmss");
                 string filename = $"replay_{timestamp}.dat";
                 string path = Path.Combine(replayDirectory, filename);
-                using (FileStream stream = new FileStream(path, FileMode.Create, FileAccess.Write))
+                await Task.Run(() =>
                 {
-                    IFormatter formatter = new BinaryFormatter();
-                    formatter.Serialize(stream, recordedFrames);
-                }
+                    using (FileStream stream = new FileStream(path, FileMode.Create, FileAccess.Write))
+                    {
+                        IFormatter formatter = new BinaryFormatter();
+                        formatter.Serialize(stream, recordedFrames);
+                    }
+                });
                 MelonLogger.Msg($"Recording saved successfully as {filename}.");
             }
             catch (Exception ex)
@@ -621,7 +699,8 @@ namespace SlapshotReplayMod
     }
 }
 
-//Add button to stop playback (isFinished = true)
 //Make replays transferrable between versions
 //Troubleshoot problem where replays continously play 
 //Troubleshoot pressing different buttons play same replay
+//Body object also have Player tag so get rid of them some
+//PlaybackFrame gets tags every frame (TOP PRIORITY)
